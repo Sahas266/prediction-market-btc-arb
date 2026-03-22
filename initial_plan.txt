@@ -1,5 +1,32 @@
 # Strategy Spec: Polymarket BTC 5m/15m Same-End-Time Bracket Arb
 
+## Current Repo Validation Status
+
+This file is the original strategy spec. The live scanner built from it has now produced both negative and positive real-window results.
+
+As of March 22, 2026:
+- the original negative-only conclusion was partly distorted by two implementation bugs:
+  - Polymarket recurring-window anchor extraction from raw HTML regex
+  - incorrect CLOB top-of-book interpretation from unsorted arrays
+- both bugs are fixed in the Rust scanner
+- patched live findings now show:
+  - `5:10PM-5:15PM ET` window: captured executable snapshots were all negative
+  - `5:25PM-5:30PM ET` window: profitable moments did occur
+    - executable snapshots: `118`
+    - profitable snapshots: `29`
+    - first profitable snapshot: `2026-03-22T17:28:46.531154800-04:00`
+    - best observed edge: about `+0.30195`
+
+Interpretation:
+- the core bracket identity is valid
+- the trade is not always available
+- the edge can appear only late in the final 5-minute window
+
+See:
+- `RESEARCH_LOG.md`
+- `data/live/pair_scans.ndjson`
+- `src/main.rs`
+
 ## Goal
 Exploit deterministic payoff relationships between:
 - one BTC 15-minute Up/Down market ending at time T

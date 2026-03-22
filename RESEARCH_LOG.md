@@ -30,14 +30,25 @@
 - `B` is latency-sensitive.
   - The implementation now sources `B` from Chainlink's direct benchmark tick stream as soon as the 5-minute window opens.
 - This should be faster and more robust than waiting for Polymarket's 5-minute page state to become unambiguous.
+- Live `A` is now sourced from the Polymarket page hydration payload, not raw regex over the HTML blob.
+  - Exact source: the `__NEXT_DATA__` `crypto-prices` query `openPrice`
+- Closed-window `A` and `B` are now sourced from Gamma `events[].eventMetadata.priceToBeat` when available.
 
 ## Polymarket HTML Caveat
 - The Polymarket event page contains many recurring-window objects for neighboring windows.
 - A naive regex over the whole HTML blob can silently bind a slug from one object to `priceToBeat` from another object.
 - This is especially dangerous for 5-minute markets because many nearby archived windows are embedded in the same page hydration payload.
 - Conclusion:
-  - Do not trust a global HTML regex as proof of exact live 5-minute `B`.
-  - Treat public HTML as acceptable for current `A` usage but not for exact live `B` verification.
+  - Do not trust a global HTML regex as proof of exact anchors.
+  - Parse the structured page payload instead.
+  - The `__NEXT_DATA__` script tag can include extra attributes like `crossorigin`, so exact-tag regexes can miss it.
+
+## CLOB Book Normalization
+- The public CLOB `book` response is not returned best-first.
+- Correct normalization:
+  - bids descending
+  - asks ascending
+- Before this fix, the scanner was reading the wrong end of the book and producing fake near-`1.98` package costs.
 
 ## Verification Results
 - Historical backfill over the last 24 hours ran successfully and produced `96` pair rows.
@@ -49,6 +60,35 @@
 - Interpretation:
   - minute bars are useful for rough sanity checks
   - minute bars are not exact enough to prove opening-anchor equality
+- Post-fix validation on March 22, 2026:
+  - live 5:10PM-5:15PM ET window:
+    - `A = 68168.33529096024` from Polymarket `__NEXT_DATA__`
+    - exact page query match: `["crypto-prices","price","BTC","2026-03-22T21:00:00Z","fifteen","2026-03-22T21:15:00Z"]`
+    - Chainlink 5:00PM minute open proxy: `68168.82957403638`
+    - delta `A - proxy`: about `-0.49428`
+    - selected pair: `D15+U5`
+    - observed package cost after CLOB normalization: about `1.11-1.21`
+    - observed edge after fix: about `-0.11` to `-0.21`
+  - full patched live 5:25PM-5:30PM ET window:
+    - executable snapshots: `118`
+    - profitable snapshots: `29`
+    - first profitable snapshot: `2026-03-22T17:28:46.531154800-04:00`
+    - last profitable snapshot: `2026-03-22T17:29:55.234304100-04:00`
+    - best observed edge: about `+0.30195`
+    - best observed cost: about `0.69805`
+    - worst observed edge in that same window: about `-0.68781`
+    - early in the window the selected pair was `D15+U5`
+    - profitable rows appeared only after the pair flipped to `U15+D5`
+    - interpretation:
+      - profitable live windows do exist
+      - profitability can emerge late rather than immediately at the 5-minute open
+- Historical sanity run after the fix:
+  - recent backfill rows now show `polymarket_gamma_event_metadata` as the anchor source for closed windows
+  - examples:
+    - 4:30PM-4:45PM ET `A = 68312.1083495388`
+    - 4:45PM-5:00PM ET `A = 68361.713848192`
+    - 4:40PM-4:45PM ET `B = 68232.09734852398`
+    - 4:55PM-5:00PM ET `B = 68195.981`
 
 ## Current Output Artifacts
 - `data/chainlink/context.json`
@@ -60,22 +100,23 @@
 
 ## Current Operational Policy
 - Live scanner:
-  - use Polymarket 15m `priceToBeat` for `A`
+  - use Polymarket structured page hydration `openPrice` for live `A`
   - use first Chainlink benchmark tick at/after final 5m open for `B`
   - log pair state and orderbooks during the final 5m window
 - Historical scanner:
-  - use Polymarket archived anchors where available
+  - use Gamma `eventMetadata.priceToBeat` where available
   - compare against Chainlink minute bars as approximation only
 
 ## Known Gaps
 - No slug-stable public Polymarket endpoint has been confirmed yet for exact live 5-minute `priceToBeat`.
-- Archived 5-minute anchor extraction from public HTML still needs a safer parser.
 - No websocket orderbook logger yet.
 - No trade execution path yet.
+- Live Polymarket-side `B` parity checking is still unresolved.
+- Historical minute-bar comparisons are still only proxies, not tick-perfect reconstructions.
 
 ## Recommended Next Steps
-- Build a structured parser for the Polymarket hydration payload instead of regex over raw HTML.
-- Search for the hydrated frontend endpoint that directly serves the event payload with `eventMetadata.priceToBeat`.
+- Keep the structured Polymarket hydration parser and remove the legacy raw-regex fallback once confidence is high enough.
+- Search for the hydrated frontend endpoint that directly serves the same `crypto-prices` / anchor data without the full page HTML.
 - Add websocket logging for Polymarket books.
 - Add post-close reconciliation that compares:
   - live-captured Chainlink `B`

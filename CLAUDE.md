@@ -1,58 +1,155 @@
-# Prediction Market BTC Arb
+# CLAUDE.md
 
-## Project overview
-Polymarket BTC 5m/15m same-end-time bracket arbitrage. Exploit deterministic payoff relationships between a BTC 15-minute Up/Down market and the final BTC 5-minute Up/Down market sharing the same end time T. The correct diagonal pair (determined by comparing opening anchors A vs B) guarantees a $1 floor payout, with $2 in the overlap zone.
+This file provides guidance to Claude Code and other agents working in this repository.
 
-## Strategy review findings (2026-03-22)
+## Build And Run
 
-### Confirmed correct
-- Payoff math is sound across all three cases (A<B, A>B, A=B)
-- The anchor-ordering rule is **essential** — the wrong diagonal has a $0 payoff zone. You CANNOT just buy whichever diagonal is cheaper; the cheaper one is systematically the dangerous one.
-- Pairing must be restricted to the **final** 5m subwindow only (shares terminal value F)
-- Must wait until B is fixed (5m market opens) before entering
-- Resolution source: Chainlink BTC/USD data stream
+```bash
+# Build
+cargo build
 
-### Key gaps identified
-1. **"Price to Beat" API availability** — plan assumes this is queryable but never specifies how. Needs verification: is it in Gamma API response, in market description text, or frontend-only?
-2. **Token ID mapping** — Yes/No token IDs must be mapped to Up/Down per market. Not specified in plan.
-3. **Fee formula** — Polymarket CLOB fees are roughly `min(price, 1-price) * 0.02`. At typical leg prices ($0.40-0.60), total fees ~$0.02/pair, which can eat the entire edge.
-4. **Case A=B should be skipped** — no overlap bonus, edge almost certainly negative after fees.
-5. **Speed sensitivity** — edge window likely 0-60 seconds after 5m market opens. Need <5s total latency budget.
-6. **Settlement mechanics** — plan doesn't cover auto-redemption vs manual claim, settlement timing, or capital lockup.
-7. **Pseudocode size loop is backwards** — iterates smallest-first and breaks; should iterate largest-first to maximize profitable size.
-8. **No scanner-first phase** — should log-only for 48h+ before risking capital.
+# Run all (backfill + live scanner)
+cargo run -- run-all --backfill-hours 24 --live-duration-seconds 90 --poll-interval-ms 1000
 
-### Recommended implementation order
-1. API discovery script — verify "Price to Beat" is programmatically accessible
-2. Token ID mapper — confirm Yes=Up, No=Down per market
-3. Fee formula integration — hard-code actual Polymarket fee curve
-4. Phase 0 scanner/logger — no execution, data collection for 48h
-5. Analyze Phase 0 data — confirm edge exists in practice
-6. Build executor — only if Phase 0 confirms viable edges
+# Backfill only
+cargo run -- backfill --hours 24
 
-## Polymarket API reference
+# Live scanner only
+cargo run -- live --duration-seconds 300 --poll-interval-ms 1000
 
-### API docs
-- Introduction: https://docs.polymarket.com/api-reference/introduction
-- Auth: https://docs.polymarket.com/api-reference/authentication
-- Clients/SDKs: https://docs.polymarket.com/api-reference/clients-sdks
+# There are no tests yet
+cargo test
+```
 
-### Three API services
-- **Gamma API** — markets, events, tags, series, comments, search
-- **Data API** — user positions, trades, activity, holder data
-- **CLOB API** — orderbook data, pricing, midpoints, spreads, fee rates
+Requires `.env` with:
+- `OPENROUTER_API_KEY`
+- `POLYMARKET_API_KEY`
+- `POLYMARKET_API_ADDRESS`
+- `POLYGON_PRIVATE_KEY`
+- `POLYGON_ADDRESS`
 
-### Gamma API market discovery
-- Endpoint pattern: `https://gamma-api.polymarket.com/markets?slug_contains=btc-5-minute`
-- Full schema not yet verified — need to dump response to find "Price to Beat" field
+## Architecture
 
-### Resolution source (BTC markets)
-"This market will resolve to 'Up' if the Bitcoin price at the end of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to 'Down'. Resolution source: Chainlink BTC/USD data stream at https://data.chain.link/streams/btc-usd."
+Single-file Rust binary in [src/main.rs](c:/Users/sahas/Github%20Repos/prediction-market-btc-arb/src/main.rs). The project is still log-only and does not place trades.
 
-### Auth credentials
-- `.env` has: POLYMARKET_API_KEY, POLYMARKET_API_SECRET, POLYMARKET_API_PASSPHRASE, POLYGON_PRIVATE_KEY, POLYGON_PUBLIC_KEY, OPEN_ROUTER_API_KEY
+CLI subcommands:
+- `run-all`
+- `backfill`
+- `live`
 
-### Unknown/unverified
-- Whether "Price to Beat" is a field in Gamma API market response or only in frontend
-- Fee rate endpoint exists but formula not confirmed from docs
-- Token ID structure (which token = Yes/Up vs No/Down)
+### Data Flow
+
+1. Chainlink context:
+   - scrape `https://data.chain.link/streams/btc-usd` to get the feed ID
+   - fetch 1-day minute bars
+   - fetch live benchmark/bid/ask ticks
+2. Polymarket market discovery:
+   - fetch market metadata from Gamma by slug
+3. Anchor extraction:
+   - live windows: use Polymarket page `__NEXT_DATA__` and read the exact `crypto-prices` query `openPrice`
+   - closed windows: use Gamma `events[].eventMetadata.priceToBeat`
+4. Pair analysis:
+   - match a 15m market with the final 5m market sharing the same end time
+   - choose the correct diagonal from anchor ordering
+   - normalize CLOB books before computing best quotes and executable costs
+5. Output:
+   - write NDJSON and JSON artifacts under `data/`
+
+### Key Functions
+
+- `scan_live_once()`:
+  main per-tick timing logic
+- `load_pair_detail()`:
+  fetches both markets, anchors, and orderbooks and builds the pair snapshot
+- `select_legs()`:
+  implements the anchor-ordering rule
+- `fetch_price_to_beat()`:
+  now uses structured Polymarket sources instead of raw regex-only HTML scraping
+- `fetch_orderbook()`:
+  normalizes bids descending and asks ascending
+- `executable_cost()`:
+  walks the ask ladder and includes taker fees
+
+## External APIs
+
+- Chainlink stream page:
+  `https://data.chain.link/streams/btc-usd`
+- Chainlink live reports:
+  `https://data.chain.link/api/live-data-engine-stream-data`
+- Chainlink 1-minute bars:
+  `https://data.chain.link/api/historical-data-engine-stream-data`
+- Polymarket Gamma by slug:
+  `https://gamma-api.polymarket.com/markets/slug/{slug}`
+- Polymarket CLOB book:
+  `https://clob.polymarket.com/book?token_id={id}`
+- Polymarket event page:
+  `https://polymarket.com/event/{slug}`
+
+## Strategy Overview
+
+The strategy pairs:
+- one BTC 15-minute Up/Down market
+- the final BTC 5-minute Up/Down market with the same end time
+
+If `A < B`, the correct diagonal is `U15 + D5`.
+
+If `A > B`, the correct diagonal is `D15 + U5`.
+
+The correct diagonal has a deterministic `$1` floor payoff and a `$2` overlap zone.
+
+## Current Status
+
+Current state:
+- working Rust scanner/logger
+- live and historical logging both functional
+- no execution bot yet
+
+What is fixed:
+- bad recurring-window anchor extraction from raw Polymarket HTML
+- bad CLOB top-of-book interpretation from unsorted arrays
+
+What is still missing:
+- websocket-based low-latency ingestion
+- live Polymarket-side `B` verification from a slug-stable public endpoint
+- execution, inventory handling, and settlement automation
+
+## March 22, 2026 Findings
+
+### Fixed Measurement Bugs
+
+- Earlier negative readings were partly false.
+- Root causes:
+  - raw HTML regex could bind the wrong recurring market anchor
+  - CLOB books are not returned best-first, so naive `.asks.first()` was wrong
+
+### Patched Live Results
+
+- `5:10PM-5:15PM ET` window:
+  - captured executable snapshots were all negative
+  - best observed edge was about `-0.1093`
+
+- `5:25PM-5:30PM ET` window:
+  - executable snapshots: `118`
+  - profitable snapshots: `29`
+  - first profitable snapshot:
+    `2026-03-22T17:28:46.531154800-04:00`
+  - best observed edge:
+    about `+0.30195`
+  - best observed package cost:
+    about `0.69805`
+
+### Interpretation
+
+- The strategy is not continuously available.
+- Some windows are fully unprofitable.
+- Some windows become profitable late in the final 5-minute period.
+- The scanner is now good enough to prove that profitable live moments can appear.
+
+## Recommended Next Steps
+
+1. Add websocket logging for Polymarket books and, if possible, market updates.
+2. Capture more live windows and characterize:
+   - frequency of profitable windows
+   - time-within-window that profit first appears
+   - available size at positive edge
+3. Only build execution after confirming the profitable windows survive realistic fill assumptions.

@@ -110,6 +110,21 @@ struct FeeSchedule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct GammaEventMetadata {
+    #[serde(rename = "priceToBeat", default, deserialize_with = "de_opt_f64_from_any")]
+    price_to_beat: Option<f64>,
+    #[serde(rename = "finalPrice", default, deserialize_with = "de_opt_f64_from_any")]
+    final_price: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GammaEvent {
+    slug: Option<String>,
+    #[serde(rename = "eventMetadata")]
+    event_metadata: Option<GammaEventMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GammaMarket {
     id: String,
     question: String,
@@ -147,6 +162,8 @@ struct GammaMarket {
         deserialize_with = "de_opt_f64_from_any"
     )]
     last_trade_price: Option<f64>,
+    #[serde(default)]
+    events: Vec<GammaEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -505,16 +522,16 @@ async fn load_pair_detail(
         five_start_et.with_timezone(&Utc).timestamp()
     );
 
-    let (fifteen_market, five_market, fifteen_anchor) = tokio::try_join!(
+    let (fifteen_market, five_market) = tokio::try_join!(
         fetch_gamma_market(client, &fifteen_slug),
         fetch_gamma_market(client, &five_slug),
-        fetch_price_to_beat(client, &fifteen_slug),
     )?;
+    let fifteen_anchor = fetch_price_to_beat(client, &fifteen_market).await?;
     let live_mode = live_five_anchor_override.is_some();
     let polymarket_five_anchor: Option<PriceBeat> = None;
     let five_anchor = match live_five_anchor_override {
         Some(anchor) => anchor,
-        None => fetch_price_to_beat(client, &five_slug).await?,
+        None => fetch_price_to_beat(client, &five_market).await?,
     };
 
     let fifteen_snapshot = MarketSnapshot {
@@ -978,40 +995,56 @@ async fn fetch_gamma_market(client: &reqwest::Client, slug: &str) -> Result<Gamm
         .with_context(|| format!("failed to deserialize market {slug}"))
 }
 
-async fn fetch_price_to_beat(client: &reqwest::Client, slug: &str) -> Result<PriceBeat> {
+async fn fetch_price_to_beat(client: &reqwest::Client, market: &GammaMarket) -> Result<PriceBeat> {
+    if let Some(price) = gamma_price_to_beat(market) {
+        return Ok(PriceBeat {
+            slug: market.slug.clone(),
+            price_to_beat: price,
+            source: "polymarket_gamma_event_metadata".to_string(),
+            extracted_at: Utc::now(),
+        });
+    }
+
     let html = client
-        .get(format!("{POLYMARKET_EVENT_PAGE}/{slug}"))
+        .get(format!("{POLYMARKET_EVENT_PAGE}/{}", market.slug))
         .send()
         .await?
         .error_for_status()?
         .text()
         .await?;
 
-    let scoped_pattern = format!(
-        r#"(?s)"slug":"{}".*?"priceToBeat":([0-9.]+)"#,
-        regex::escape(slug)
-    );
-    let regex = Regex::new(&scoped_pattern)?;
-    let captures = regex
-        .captures(&html)
-        .ok_or_else(|| anyhow!("priceToBeat not found for {slug}"))?;
-    let price = captures
-        .get(1)
-        .ok_or_else(|| anyhow!("missing price capture for {slug}"))?
-        .as_str()
-        .parse::<f64>()
-        .with_context(|| format!("invalid priceToBeat for {slug}"))?;
+    let price = match extract_next_data_payload(&html)
+        .and_then(|payload| extract_open_price_from_next_data(&payload, market))
+    {
+        Ok(price) => price,
+        Err(_) => {
+            let scoped_pattern = format!(
+                r#"(?s)"slug":"{}".*?"priceToBeat":([0-9.]+)"#,
+                regex::escape(&market.slug)
+            );
+            let regex = Regex::new(&scoped_pattern)?;
+            let captures = regex
+                .captures(&html)
+                .ok_or_else(|| anyhow!("priceToBeat not found for {}", market.slug))?;
+            captures
+                .get(1)
+                .ok_or_else(|| anyhow!("missing price capture for {}", market.slug))?
+                .as_str()
+                .parse::<f64>()
+                .with_context(|| format!("invalid priceToBeat for {}", market.slug))?
+        }
+    };
 
     Ok(PriceBeat {
-        slug: slug.to_string(),
+        slug: market.slug.clone(),
         price_to_beat: price,
-        source: "polymarket_event_html".to_string(),
+        source: "polymarket_next_data_open_price".to_string(),
         extracted_at: Utc::now(),
     })
 }
 
 async fn fetch_orderbook(client: &reqwest::Client, token_id: &str) -> Result<OrderBook> {
-    client
+    let mut book = client
         .get(POLYMARKET_ORDERBOOK)
         .query(&[("token_id", token_id)])
         .send()
@@ -1019,7 +1052,108 @@ async fn fetch_orderbook(client: &reqwest::Client, token_id: &str) -> Result<Ord
         .error_for_status()?
         .json::<OrderBook>()
         .await
-        .with_context(|| format!("failed to deserialize orderbook for token {token_id}"))
+        .with_context(|| format!("failed to deserialize orderbook for token {token_id}"))?;
+
+    // The CLOB payload is not returned best-first, so normalize the arrays once
+    // before computing best quotes or walking the asks for executable cost.
+    book.bids.sort_by(|a, b| b.price.total_cmp(&a.price));
+    book.asks.sort_by(|a, b| a.price.total_cmp(&b.price));
+    Ok(book)
+}
+
+fn gamma_price_to_beat(market: &GammaMarket) -> Option<f64> {
+    market
+        .events
+        .iter()
+        .find_map(|event| event.event_metadata.as_ref()?.price_to_beat)
+}
+
+fn extract_next_data_payload(html: &str) -> Result<Value> {
+    let next_data_regex = Regex::new(r#"<script id="__NEXT_DATA__"[^>]*>(.*?)</script>"#)?;
+    let captures = next_data_regex
+        .captures(html)
+        .ok_or_else(|| anyhow!("could not locate Polymarket __NEXT_DATA__ payload"))?;
+    let next_json = captures
+        .get(1)
+        .ok_or_else(|| anyhow!("missing Polymarket JSON capture"))?
+        .as_str();
+    Ok(serde_json::from_str(next_json)?)
+}
+
+fn extract_open_price_from_next_data(payload: &Value, market: &GammaMarket) -> Result<f64> {
+    let queries = payload["props"]["pageProps"]["dehydratedState"]["queries"]
+        .as_array()
+        .ok_or_else(|| anyhow!("missing Polymarket dehydratedState queries"))?;
+
+    let expected_interval = market_interval_label(&market.slug)?;
+    let expected_start = market_start_time_utc(&market.slug)?;
+    let expected_end = DateTime::parse_from_rfc3339(&market.end_date)
+        .with_context(|| format!("invalid endDate for {}", market.slug))?
+        .with_timezone(&Utc);
+
+    for query in queries {
+        let Some(query_key) = query["queryKey"].as_array() else {
+            continue;
+        };
+        if query_key.len() < 6
+            || query_key[0].as_str() != Some("crypto-prices")
+            || query_key[1].as_str() != Some("price")
+            || query_key[2].as_str() != Some("BTC")
+            || query_key[4].as_str() != Some(expected_interval)
+        {
+            continue;
+        }
+
+        let key_start = parse_value_datetime_utc(&query_key[3]);
+        let key_end = parse_value_datetime_utc(&query_key[5]);
+        if key_start != Some(expected_start) || key_end != Some(expected_end) {
+            continue;
+        }
+
+        if let Some(price) = value_to_f64_opt(&query["state"]["data"]["openPrice"]) {
+            return Ok(price);
+        }
+    }
+
+    Err(anyhow!(
+        "openPrice query not found in Polymarket page payload for {}",
+        market.slug
+    ))
+}
+
+fn market_interval_label(slug: &str) -> Result<&'static str> {
+    if slug.contains("-15m-") {
+        Ok("fifteen")
+    } else if slug.contains("-5m-") {
+        Ok("five")
+    } else {
+        Err(anyhow!("unsupported market interval for {slug}"))
+    }
+}
+
+fn market_start_time_utc(slug: &str) -> Result<DateTime<Utc>> {
+    let timestamp = slug
+        .rsplit('-')
+        .next()
+        .ok_or_else(|| anyhow!("missing unix timestamp in {slug}"))?
+        .parse::<i64>()
+        .with_context(|| format!("invalid unix timestamp in {slug}"))?;
+    DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .ok_or_else(|| anyhow!("invalid timestamp {timestamp} in {slug}"))
+}
+
+fn parse_value_datetime_utc(value: &Value) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value.as_str()?)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn value_to_f64_opt(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|v| v as f64))
+        .or_else(|| value.as_u64().map(|v| v as f64))
+        .or_else(|| value.as_str()?.parse::<f64>().ok())
 }
 
 fn floor_to_window(
@@ -1089,7 +1223,7 @@ where
 {
     let value = Option::<Value>::deserialize(deserializer)?;
     value
-        .map(value_to_f64)
+        .map(|value| value_to_f64(value))
         .transpose()
         .map_err(D::Error::custom)
 }

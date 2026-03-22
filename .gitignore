@@ -1,1 +1,5 @@
+.env
+.env.*
+!.env.example
 target/
+tmp_polymarket_event*.html
