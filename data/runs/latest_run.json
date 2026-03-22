@@ -1,0 +1,10 @@
+{
+  "started_at": "2026-03-22T20:08:18.906653800Z",
+  "command": "live",
+  "chainlink_feed_id": "0x00039d9e45394f473ab1f050a1b963e6b05351e52d71e507509ada0c95ed75b8",
+  "notes": [
+    "Rust-only implementation",
+    "Log-only; no execution path",
+    "Historical compare uses Chainlink 1-minute bars"
+  ]
+}

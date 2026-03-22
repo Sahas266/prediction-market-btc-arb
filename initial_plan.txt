@@ -1,0 +1,420 @@
+# Strategy Spec: Polymarket BTC 5m/15m Same-End-Time Bracket Arb
+
+## Goal
+Exploit deterministic payoff relationships between:
+- one BTC 15-minute Up/Down market ending at time T
+- one BTC 5-minute Up/Down market covering the final 5 minutes and also ending at time T
+
+This is a same-venue, same-resolution-source strategy.
+Do not generalize this logic across Kalshi or any other venue.
+
+---
+
+## Market Definitions
+
+For a 15-minute market ending at time T:
+- Let A = Chainlink BTC/USD value at the start of the 15-minute window
+- Let F = Chainlink BTC/USD value at the end of the 15-minute window (time T)
+
+For the final 5-minute market ending at the same time T:
+- Let B = Chainlink BTC/USD value at the start of that 5-minute window
+- The final value is the same F
+
+Binary outcomes:
+- U15 = 1 if F >= A else 0
+- D15 = 1 if F < A else 0
+- U5  = 1 if F >= B else 0
+- D5  = 1 if F < B else 0
+
+---
+
+## Core Identity
+
+Exactly one of the following is always true:
+
+### Case 1: A < B
+Then the pair:
+- BUY U15
+- BUY D5
+
+has payoff:
+- F < A      -> 0 + 1 = 1
+- A <= F < B -> 1 + 1 = 2
+- F >= B     -> 1 + 0 = 1
+
+So U15 + D5 always pays at least 1.
+
+### Case 2: A > B
+Then the pair:
+- BUY D15
+- BUY U5
+
+has payoff:
+- F < B      -> 1 + 0 = 1
+- B <= F < A -> 1 + 1 = 2
+- F >= A     -> 0 + 1 = 1
+
+So D15 + U5 always pays at least 1.
+
+### Case 3: A = B
+Then either pair pays exactly 1.
+
+This means the correct pair is a static bracket around F.
+
+---
+
+## Strategy Rule
+
+For each 15-minute BTC market ending at T:
+
+1. Identify the final 5-minute BTC market also ending at T.
+2. Read fixed start anchors:
+   - A = 15-minute start anchor
+   - B = 5-minute start anchor
+3. If A < B:
+   - candidate pair = U15 + D5
+4. Else if A > B:
+   - candidate pair = D15 + U5
+5. Else:
+   - candidate pair = either complementary pair; value floor is exactly 1
+
+Trade only if:
+- total executable entry cost + total fees < guaranteed floor payout
+- i.e. pair_cost_net < 1.00
+
+---
+
+## Edge Formula
+
+Define:
+- ask(x) = best executable ask for leg x
+- fee(x, size, price) = expected taker fee for that leg
+- slippage_buffer = conservative extra cost estimate
+- fill_buffer = expected partial-fill / legging cost reserve
+
+Then:
+
+edge = 1.00
+       - ask(leg1)
+       - ask(leg2)
+       - fee(leg1)
+       - fee(leg2)
+       - slippage_buffer
+       - fill_buffer
+
+Trade only if:
+- edge >= min_edge_threshold
+
+Suggested:
+- min_edge_threshold >= 0.01 to 0.03 per $1 notional initially
+- tune upward if books are thin
+
+---
+
+## Required Inputs
+
+### Market Discovery
+Need to identify:
+- active BTC 15-minute markets
+- active BTC 5-minute markets
+- end timestamps
+- token IDs for Yes/No legs
+- current status / tradability
+
+### Market State
+For each candidate pair:
+- 15m start time
+- 15m end time
+- 5m start time
+- 5m end time
+- "Price to Beat" / opening anchor for each market
+- current best ask for relevant token
+- available ask size at or below max acceptable price
+- feesEnabled / fee-rate if available
+
+### Execution State
+- wallet balances
+- open orders
+- partially filled orders
+- current positions by token
+- time remaining to expiry
+
+---
+
+## Pairing Logic
+
+For a 15-minute market [t0, T]:
+- only pair it with the 5-minute market [T-5m, T]
+
+Do NOT pair with:
+- the first 5-minute subwindow
+- the middle 5-minute subwindow
+- any 5-minute market with a different end time
+
+Only the final 5-minute market shares the same terminal value F in the payoff identity above.
+
+---
+
+## Timing Logic
+
+### Earliest time strategy becomes valid
+The strategy becomes fully determined once both A and B are fixed.
+
+That means:
+- wait until the final 5-minute market starts
+- at that moment, both start anchors are known
+- then choose the correct bracket pair
+
+Before B is fixed, do not enter under this exact arb framework.
+
+### Latest entry time
+Need enough time before T to:
+- fetch order books
+- estimate executable size
+- place both orders
+- verify fills
+- hedge partial fills if needed
+
+Suggested:
+- stop entering new trades inside final 10-20 seconds unless depth is excellent and automation is hardened
+
+---
+
+## Execution Logic
+
+### Preferred mode
+Use aggressive-but-bounded limit orders, not naive market orders.
+
+Reason:
+- all orders are limit orders under the hood anyway
+- displayed UI prices may not equal executable prices
+- need tight control of worst-case pair cost
+
+### Order placement sequence
+1. Snapshot both books
+2. Compute executable cost for target size
+3. If pair edge >= threshold:
+   - either:
+     a) place both orders near-simultaneously, or
+     b) place thinner leg first if its liquidity is more likely to disappear
+4. Monitor fills immediately
+5. If one leg partially fills and the other does not:
+   - continue filling second leg only up to matched filled quantity
+   - cancel excess unmatched quantity if edge deteriorates
+6. Never leave unhedged directional exposure intentionally unless separate alpha logic exists
+
+### Size logic
+Tradable size is capped by:
+- min executable depth across both legs at acceptable prices
+- wallet balance
+- per-market position limits if any internal risk caps are set
+
+Use:
+tradable_size = min(depth_leg1, depth_leg2, risk_cap_size, wallet_cap_size)
+
+---
+
+## Price Computation
+
+For each leg, compute actual entry cost from order book depth, not UI price.
+
+For target quantity q:
+- walk the ask ladder
+- compute VWAP fill price
+- compute total spend
+- add expected taker fee
+
+Use:
+effective_cost(leg, q) = gross_vwap_cost + fee + slippage_reserve
+
+Then:
+pair_cost(q) = effective_cost(leg1, q) + effective_cost(leg2, q)
+
+Edge at size q:
+edge(q) = q - pair_cost(q)
+
+Trade only if:
+- edge(q) > 0
+- and edge_per_share(q) >= threshold
+
+---
+
+## Risk Controls
+
+### 1. Fill risk
+Main operational risk is legging:
+- one leg fills
+- other leg slips away
+
+Mitigation:
+- pre-check book depth
+- use bounded limits
+- cancel unmatched residual quickly
+- cap order size to visible depth
+- maintain emergency flatten logic
+
+### 2. Fee misestimation
+Do not assume zero fees.
+Pull fee-rate where possible or conservatively overestimate.
+
+### 3. Wrong market pairing
+Validate:
+- same underlying asset
+- same venue
+- same resolution source family
+- exact same end timestamp T
+- 5m market must be final 5m segment of 15m window
+
+### 4. Wrong anchor extraction
+Use the market’s fixed opening reference, not external spot BTC, and not the UI’s current live price.
+
+### 5. Last-second book collapse
+Liquidity can disappear near expiry.
+Either:
+- widen threshold near close
+- or refuse entries inside a short time-to-expiry window
+
+### 6. Stale data
+Require fresh snapshots.
+Reject if:
+- order book snapshot older than max_staleness_ms
+- market metadata older than max_metadata_staleness_s
+
+---
+
+## Monitoring and Logging
+
+Log every evaluated pair with:
+- timestamp
+- 15m market ID
+- 5m market ID
+- A
+- B
+- chosen pair type
+- best asks
+- estimated fees
+- expected edge
+- order IDs
+- filled size
+- realized net PnL
+
+Also store rejected opportunities with reject reason:
+- negative edge
+- insufficient depth
+- stale data
+- anchor unavailable
+- too close to expiry
+- one leg halted/not tradable
+
+---
+
+## Backtesting / Replay Framework
+
+Need historical reconstruction from:
+- market metadata
+- historical order books or trades if available
+- historical anchors A and B
+- realized settlement outcome F
+
+For each historical 15m window:
+1. identify final 5m window
+2. record A and B
+3. determine chosen bracket pair
+4. simulate executable costs using historical book/trade proxy
+5. subtract fees
+6. compute realized return:
+   - floor = 1
+   - overlap payout = 2 when F lies between anchors
+
+Key metrics:
+- gross edge frequency
+- net edge after fees
+- fill-adjusted edge
+- average holding time
+- overlap frequency (double-win rate)
+- worst partial-fill drawdown
+
+---
+
+## Minimum Viable Bot
+
+### Scanner
+- discover current BTC 15m markets
+- map each to final BTC 5m market ending at same T
+- once B is fixed, compute candidate pair
+- read order books
+- estimate pair cost at test sizes
+- rank opportunities by net edge
+
+### Executor
+- place capped limit orders on both legs
+- verify fills
+- cancel unmatched remainder
+- store execution record
+
+### Risk daemon
+- block trades too near expiry
+- block stale data
+- block if required book depth missing
+- cap per-pair notional
+- cap aggregate open short-horizon exposure
+
+---
+
+## Hard Constraints
+
+Do not treat this as guaranteed free money unless:
+- same source
+- same end timestamp
+- correct bracket pair
+- executable all-in cost below 1
+- both legs actually fill
+
+If any of those fail, this is no longer static arbitrage.
+
+---
+
+## Pseudocode
+
+for each active_15m_market ending at T:
+    five = find_final_5m_market_ending_at(T)
+    if five is None:
+        continue
+
+    A = get_start_anchor(active_15m_market)
+    B = get_start_anchor(five)
+
+    if A is None or B is None:
+        continue
+
+    if A < B:
+        leg1 = U15(active_15m_market)
+        leg2 = D5(five)
+    elif A > B:
+        leg1 = D15(active_15m_market)
+        leg2 = U5(five)
+    else:
+        leg1 = U15(active_15m_market)
+        leg2 = D5(five)
+
+    for q in candidate_sizes:
+        cost1 = effective_cost_from_book(leg1, q)
+        cost2 = effective_cost_from_book(leg2, q)
+        edge = q - cost1 - cost2
+
+        if edge >= min_edge_threshold_cash:
+            submit_paired_orders(leg1, leg2, q, max_price_constraints)
+            monitor_fills()
+            reconcile_unmatched_quantity()
+            log_trade()
+            break
+
+Polymarket references:
+https://docs.polymarket.com/api-reference/introduction
+https://docs.polymarket.com/api-reference/authentication
+https://docs.polymarket.com/api-reference/clients-sdks
+
+Polymarket BTC resolution source:
+This market will resolve to "Up" if the Bitcoin price at the end of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to "Down".
+The resolution source for this market is information from Chainlink, specifically the BTC/USD data stream available at https://data.chain.link/streams/btc-usd.
+Please note that this market is about the price according to Chainlink data stream BTC/USD, not according to other sources or spot markets.
