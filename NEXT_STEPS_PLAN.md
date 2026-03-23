@@ -1,70 +1,67 @@
 # Next Steps Plan: Execution-Readiness With Paper Trading
 
+## Status Update
+
+- The main capture and paper-trading foundation is already in place in Rust.
+- Completed since this plan was written:
+  - modular refactor out of `src/main.rs`
+  - Polymarket websocket orderbook capture
+  - raw Chainlink tick logging
+  - derived executable package pricing by size bucket
+  - `replay`, `summarize`, and `paper-trade` commands
+  - live paper-trade emission during active runs
+  - user-runnable helper script at `scripts/run_live.ps1`
+- Current remaining focus:
+  - raw websocket-event-first replay hardening
+  - settlement reconciliation
+  - more live evidence collection
+  - dynamic sizing only after the first confirmed successful real-time live paper-trade entry
+
 ## Summary
 
 - Advance the project from a log-only scanner to a capture, replay, and paper-trading system in Rust.
 - Keep the next milestone strictly non-custodial: no live order submission, no signing, and no wallet-side effects.
 - Define success as: full final-5m window capture with lower-latency market data, deterministic replay over captured runs, fee-adjusted size-aware opportunity scoring, and paper-trade results reconciled against settled outcomes.
 
-## Implementation Changes
+## Remaining Implementation Changes
 
-### 1. Refactor the scanner into clear subsystems
+### 1. Harden replay around raw events
 
-- Keep `src/main.rs` as CLI wiring only.
-- Move source adapters, strategy logic, replay logic, and paper-trade state into separate Rust modules.
-- Preserve current `live`, `backfill`, and `run-all` commands, but route them through shared library code rather than embedding all logic inline.
+- Rebuild replay primarily from raw websocket orderbook events and raw Chainlink ticks instead of relying mainly on derived pair snapshots.
+- Keep replay output deterministic and comparable against the original saved live run.
 
-### 2. Upgrade live capture from polling-only to capture-grade logging
+### 2. Finish post-close reconciliation
 
-- Add a Polymarket websocket orderbook stream for the two selected legs during the final 5-minute window.
-- Keep the current HTTP orderbook fetch as fallback and periodic sanity snapshot, not as the primary live source.
-- Continue sourcing `A` from Polymarket structured page data and `B` from the first Chainlink benchmark tick at or after the 5-minute open.
-- Record capture timestamps, source timestamps, and local receive latency for every Chainlink tick and every book event.
-- Persist raw live inputs and derived snapshots separately so replay can operate from raw events rather than only summarized rows.
+- Compare captured `B`, archived Polymarket metadata when available, and the final resolved market outcomes.
+- Extend paper-trade logs with reconciled settlement status and realized payout.
 
-### 3. Replace top-of-book-only scoring with executable package pricing
+### 3. Expand live evidence collection
 
-- Compute package cost by walking asks across both selected legs for a configurable share ladder: `1`, `5`, `10`, `25`.
-- Include taker fees in the package cost using the fee schedule already exposed in Gamma metadata.
-- Emit both gross edge and fee-adjusted edge per size bucket.
-- Treat a signal as executable only when both legs are orderable, both asks are present, and minimum fillable size is available at the configured threshold.
-- Keep diagonal selection deterministic: use the current `A`/`B` relationship and skip `equal` cases.
+- Capture more full final-5m windows with the current continuous monitoring loop.
+- Track how often profitability appears, how late it appears, and how much size is actually executable at positive edge.
+- Confirm the first successful real-time live paper-trade entry in the always-on loop.
 
-### 4. Add a baseline paper-trading engine
+### 4. Defer dynamic sizing until after live proof
 
-- Add a `paper-trade` CLI command that consumes captured live or replayed events.
-- Baseline policy:
-  - one entry attempt per eligible final-5m window
-  - entry on the first event where fee-adjusted edge is at least `+$0.02/share`
-  - target size `5` shares, clipped down to available executable depth
-  - no re-entry after the first fill attempt in the same window
-  - hold to market resolution with no intra-window exit logic in this milestone
-- Log paper trades, entry reason, modeled fill price, size, fees, expected floor payout, and realized settled payout.
-- Mark trades as `skipped`, `entered`, `settled_win_1`, `settled_win_2`, or `settled_loss_unexpected_data_issue` so reconciliation is auditable.
-
-### 5. Add replay and post-close analytics
-
-- Add a `replay` command that rebuilds strategy state from raw captured events and reproduces paper-trade decisions deterministically.
-- Add a `summarize` command that outputs per-window metrics: positive-edge duration, first and last qualifying timestamp, best edge, fillable size, selected diagonal changes, and paper-trade outcome.
-- Historical analysis for this milestone must be replay-based over captured live windows. Do not present synthetic backtests from public historical CLOB data as if they were orderbook-accurate.
-- Add post-close reconciliation that compares captured `B`, archived Polymarket metadata when available, and the final resolved market outcomes.
+- Keep the baseline one-entry fixed-size paper-trade policy for now.
+- Only add "size as deep as profitable" logic after the first confirmed successful real-time live paper-trade entry.
 
 ## Interfaces And Outputs
 
 - Keep NDJSON and JSON storage under `data/`.
-- Add raw event logs for orderbook events and raw Chainlink ticks, plus derived window summaries and paper-trade ledgers.
-- Add CLI subcommands:
+- Continue maintaining raw event logs for orderbook events and raw Chainlink ticks, plus derived window summaries and paper-trade ledgers.
+- Active CLI subcommands:
   - `paper-trade --input <run_or_file> --min-edge-cents 2 --target-shares 5`
   - `replay --input <run_or_file>`
-  - `summarize --from <date> --to <date>`
-- Extend the existing live snapshot schema with:
+  - `summarize --input <run_or_file>`
+- Continue preserving these live snapshot fields:
   - latency fields
   - executable depth by size bucket
   - gross and net edge by size bucket
   - signal qualification state
   - diagonal-flip markers
-- Add `.env.example` entries only for non-secret runtime knobs such as minimum edge threshold, target shares, and optional websocket reconnect tuning.
-- Do not read or write any signing keys in this milestone, even if present in local `.env`.
+- Keep `.env.example` limited to non-secret runtime knobs.
+- Do not read or write signing keys in this milestone, even if present in local `.env`.
 
 ## Test Plan
 
@@ -78,7 +75,7 @@
 - Integration tests for:
   - replay of the March 22, 2026 `5:10PM-5:15PM ET` window producing no paper entry under baseline settings
   - replay of the March 22, 2026 `5:25PM-5:30PM ET` window producing at least one qualifying entry under baseline settings
-  - settlement reconciliation matching logged paper trades to final outcomes
+  - settlement reconciliation matching logged paper trades to final outcomes once reconciliation is implemented
 - Runtime acceptance checks:
   - one-hour live capture across multiple windows without panic or schema corruption
   - replay output matches original derived signals for the same run
@@ -95,4 +92,5 @@
 
 ## Operator Note
 
-- Add a user-runnable live helper script in a later step, preferably `scripts/run_live.ps1`, that launches the live scanner, timestamps the run, and writes logs to a dated file under `data/runs/` so the strategy can be monitored manually without reconstructing the CLI command each time.
+- `scripts/run_live.ps1` now exists and should remain the standard user-facing entry point for manual live monitoring.
+- Keep extending it so each live run writes a clear dated manifest and summary under `data/runs/`.
